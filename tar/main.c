@@ -66,6 +66,7 @@
 #include "common/box.h"
 #include "common/cpu-utils.h"
 #include "crypto/hash.h"
+#include "cmds/commands.h"
 
 /* ====================================================================
  * Tar format (POSIX ustar)
@@ -133,6 +134,10 @@ struct tar_ctx {
 	gzFile gz;
 	bool verbose;
 	bool get_snaps;
+	int compress_level;		/* gzip compression level 0-9 */
+	/* Reusable buffer for extent reads – avoids per-extent malloc */
+	char *io_buf;
+	size_t io_buf_size;
 };
 
 /* ====================================================================
@@ -598,13 +603,16 @@ static int copy_inline_extent(struct btrfs_root *root, gzFile gz,
  * Read a regular (non-inline) extent and write its (decompressed) contents
  * sequentially to the gzip stream.  Holes (disk_bytenr == 0) are skipped here
  * and filled by the caller via gz_write_zeros.  Updates *written.
+ *
+ * Uses ctx->io_buf as a reusable read buffer to avoid per-extent malloc/free.
  */
-static int copy_reg_extent(struct btrfs_root *root, gzFile gz,
+static int copy_reg_extent(struct tar_ctx *ctx, struct btrfs_root *root,
 			   struct extent_buffer *leaf,
 			   struct btrfs_file_extent_item *fi,
 			   u64 *written)
 {
-	char *inbuf = NULL, *outbuf = NULL;
+	gzFile gz = ctx->gz;
+	char *inbuf, *outbuf = NULL;
 	u64 bytenr, ram_size, disk_size, num_bytes, offset;
 	u64 size_left, total = 0, cur, length;
 	int compress;
@@ -630,16 +638,21 @@ static int copy_reg_extent(struct btrfs_root *root, gzFile gz,
 		size_left -= offset;
 	}
 
-	inbuf = malloc(size_left);
-	if (!inbuf)
-		return -ENOMEM;
+	/* Grow the reusable buffer only when necessary */
+	if (size_left > ctx->io_buf_size) {
+		char *p = realloc(ctx->io_buf, size_left);
+
+		if (!p)
+			return -ENOMEM;
+		ctx->io_buf      = p;
+		ctx->io_buf_size = size_left;
+	}
+	inbuf = ctx->io_buf;
 
 	if (compress != BTRFS_COMPRESS_NONE) {
 		outbuf = calloc(1, ram_size);
-		if (!outbuf) {
-			free(inbuf);
+		if (!outbuf)
 			return -ENOMEM;
-		}
 	}
 
 	num_copies = btrfs_num_copies(root->fs_info, bytenr, disk_size);
@@ -693,7 +706,7 @@ again:
 	}
 	*written = num_bytes;
 out:
-	free(inbuf);
+	/* inbuf is ctx->io_buf – do not free it here */
 	free(outbuf);
 	return ret;
 }
@@ -703,9 +716,10 @@ out:
  * the gzip stream.  Sparse regions (holes) are emitted as zero bytes so that
  * the tar entry has the correct size.
  */
-static int write_file_data(struct btrfs_root *root, gzFile gz,
+static int write_file_data(struct tar_ctx *ctx, struct btrfs_root *root,
 			   u64 ino, u64 file_size)
 {
+	gzFile gz = ctx->gz;
 	struct btrfs_path path = { 0 };
 	struct btrfs_key key, found_key;
 	struct extent_buffer *leaf;
@@ -764,7 +778,7 @@ static int write_file_data(struct btrfs_root *root, gzFile gz,
 			ret = copy_inline_extent(root, gz, &path,
 						 &bytes_written);
 		} else if (extent_type == BTRFS_FILE_EXTENT_REG) {
-			ret = copy_reg_extent(root, gz, leaf, fi,
+			ret = copy_reg_extent(ctx, root, leaf, fi,
 					      &bytes_written);
 		}
 		/* PREALLOC extents contain no initialized data – skip */
@@ -839,7 +853,7 @@ static int write_file_entry(struct tar_ctx *ctx, struct btrfs_root *root,
 	if (ret < 0)
 		return ret;
 
-	ret = write_file_data(root, ctx->gz, ino, info.size);
+	ret = write_file_data(ctx, root, ino, info.size);
 	if (ret < 0)
 		return ret;
 
@@ -1043,9 +1057,10 @@ static const char * const usage_msg[] = {
 	"format.  Sparse file regions are preserved as zero-filled data.",
 	"",
 	"Options:",
-	OPTLINE("-s|--snapshots", "also include snapshots (default: skipped)"),
-	OPTLINE("-v|--verbose",   "print each path as it is added to the archive"),
-	OPTLINE("-h|--help",      "show this help and exit"),
+	OPTLINE("-c|--compress <0-9>", "gzip compression level: 0=none 1=fastest(default) 9=best"),
+	OPTLINE("-s|--snapshots",      "also include snapshots (default: skipped)"),
+	OPTLINE("-v|--verbose",        "print each path as it is added to the archive"),
+	OPTLINE("-h|--help",           "show this help and exit"),
 	"",
 	"Compression support: zlib (output)"
 #if COMPRESSION_LZO
@@ -1064,13 +1079,14 @@ static const struct cmd_struct tar_cmd = {
 
 int BOX_MAIN(tar)(int argc, char *argv[])
 {
-	struct tar_ctx ctx   = { 0 };
+	struct tar_ctx ctx   = { .compress_level = 1 };
 	struct btrfs_fs_info *fs_info;
 	struct btrfs_root *root;
 	struct open_ctree_args oca = { 0 };
 	struct btrfs_key key;
 	const char *device;
 	const char *output;
+	char gz_mode[8];
 	/* Two 512-byte zero blocks mark end-of-archive */
 	const char end_marker[TAR_BLOCK_SIZE * 2] = { 0 };
 	int ret;
@@ -1081,16 +1097,28 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 
 	while (1) {
 		static const struct option long_opts[] = {
-			{ "snapshots", no_argument, NULL, 's' },
-			{ "verbose",   no_argument, NULL, 'v' },
-			{ "help",      no_argument, NULL, 'h' },
+			{ "compress",  required_argument, NULL, 'c' },
+			{ "snapshots", no_argument,       NULL, 's' },
+			{ "verbose",   no_argument,       NULL, 'v' },
+			{ "help",      no_argument,       NULL, 'h' },
 			{ NULL, 0, NULL, 0 }
 		};
-		int c = getopt_long(argc, argv, "svh", long_opts, NULL);
+		int c = getopt_long(argc, argv, "c:svh", long_opts, NULL);
 
 		if (c < 0)
 			break;
 		switch (c) {
+		case 'c': {
+			char *end;
+			long level = strtol(optarg, &end, 10);
+
+			if (*end != '\0' || level < 0 || level > 9) {
+				error("compression level must be 0-9");
+				return 1;
+			}
+			ctx.compress_level = (int)level;
+			break;
+		}
 		case 's':
 			ctx.get_snaps = true;
 			break;
@@ -1153,7 +1181,8 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
-	ctx.gz = gzopen(output, "wb9");
+	snprintf(gz_mode, sizeof(gz_mode), "wb%d", ctx.compress_level);
+	ctx.gz = gzopen(output, gz_mode);
 	if (!ctx.gz) {
 		error("failed to create output file '%s': %m", output);
 		close_ctree(root);
@@ -1171,6 +1200,7 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 out:
 	gzclose(ctx.gz);
 	close_ctree(root);
+	free(ctx.io_buf);
 
 	if (ret)
 		unlink(output);
