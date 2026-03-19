@@ -291,10 +291,12 @@ image_objects = image/main.o image/sanitize.o image/image-create.o image/common.
 tune_objects = tune/main.o tune/seeding.o tune/change-uuid.o tune/change-metadata-uuid.o \
 	       tune/convert-bgt.o tune/change-csum.o common/clear-cache.o tune/quota.o \
 	       tune/convert-remap-tree.o
+btrfstar_objects = tar/main.o
 all_objects = $(objects) $(cmds_objects) $(libbtrfs_objects) $(convert_objects) \
-	      $(mkfs_objects) $(image_objects) $(tune_objects) $(libbtrfsutil_objects)
+	      $(mkfs_objects) $(image_objects) $(tune_objects) $(libbtrfsutil_objects) \
+	      $(btrfstar_objects)
 
-tags_files = $(addsuffix /*.[ch], . check cmds common convert crypto image include mkfs tune \
+tags_files = $(addsuffix /*.[ch], . check cmds common convert crypto image include mkfs tar tune \
 	       kernel-lib kernel-shared kernel-shared/uapi \
 	       libbtrfs libbtrfsutil libbtrfsutil/python tests)
 
@@ -380,7 +382,7 @@ progs_box_static_objects = $(filter-out %/main.static.o, $(progs_box_all_static_
 
 # Programs to install.
 progs_install = btrfs mkfs.btrfs btrfs-map-logical btrfs-image \
-		btrfs-find-root btrfstune btrfs-select-super
+		btrfs-find-root btrfstune btrfs-select-super btrfs-tar
 
 # Programs to build.
 progs_build = $(progs_install) btrfsck btrfs-corrupt-block
@@ -454,6 +456,7 @@ static_convert_objects = $(patsubst %.o, %.static.o, $(convert_objects))
 static_mkfs_objects = $(patsubst %.o, %.static.o, $(mkfs_objects))
 static_image_objects = $(patsubst %.o, %.static.o, $(image_objects))
 static_tune_objects = $(patsubst %.o, %.static.o, $(tune_objects))
+static_btrfstar_objects = $(patsubst %.o, %.static.o, $(btrfstar_objects))
 
 libs_shared = libbtrfs.so.$(libbtrfs_version) libbtrfsutil.so.$(libbtrfsutil_version)
 lib_links = libbtrfs.so libbtrfs.so.$(LIBBTRFS_MAJOR) libbtrfs.so.$(LIBBTRFS_MAJOR).$(LIBBTRFS_MINOR) \
@@ -770,6 +773,14 @@ btrfs-image: $(image_objects) $(objects) libbtrfsutil.a
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS) $(LIBS) $(LIBS_COMP)
 
 btrfs-image.static: $(static_image_objects) $(static_objects) $(static_libbtrfs_objects)
+	@echo "  LD       $@"
+	$(Q)$(CC) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
+
+btrfs-tar: $(btrfstar_objects) $(objects) libbtrfsutil.a
+	@echo "  LD       $@"
+	$(Q)$(CC) -o $@ $^ $(LDFLAGS) $(LIBS) $(LIBS_COMP)
+
+btrfs-tar.static: $(static_btrfstar_objects) $(static_objects) $(static_libbtrfs_objects)
 	@echo "  LD       $@"
 	$(Q)$(CC) -o $@ $^ $(STATIC_LDFLAGS) $(STATIC_LIBS) $(STATIC_LIBS_COMP)
 
