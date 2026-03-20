@@ -344,11 +344,11 @@ static int write_longlink(gzFile gz, const char *longname, char type)
 	unsigned int sum;
 
 	strncpy(hdr.name, "././@LongLink", sizeof(hdr.name) - 1);
-	strncpy(hdr.mode,  "0000000", sizeof(hdr.mode)  - 1);
-	strncpy(hdr.uid,   "0000000", sizeof(hdr.uid)   - 1);
-	strncpy(hdr.gid,   "0000000", sizeof(hdr.gid)   - 1);
+	memcpy(hdr.mode,  "0000000", 7);
+	memcpy(hdr.uid,   "0000000", 7);
+	memcpy(hdr.gid,   "0000000", 7);
 	snprintf(hdr.size,  sizeof(hdr.size),  "%011zo", len);
-	strncpy(hdr.mtime, "00000000000", sizeof(hdr.mtime) - 1);
+	memcpy(hdr.mtime, "00000000000", 11);
 	hdr.type = type;
 	/* GNU tar magic */
 	memcpy(hdr.magic,   "ustar  ", 6);
@@ -459,6 +459,38 @@ struct inode_info {
 	u64 size;
 	u64 mtime;	/* seconds since epoch */
 };
+
+static int read_default_subvolid(struct btrfs_fs_info *fs_info, u64 *subvolid)
+{
+	struct btrfs_path path = { 0 };
+	struct btrfs_dir_item *di;
+	struct btrfs_key location;
+
+	di = btrfs_lookup_dir_item(NULL, fs_info->tree_root, &path,
+				   BTRFS_ROOT_TREE_DIR_OBJECTID,
+				   "default", strlen("default"), 0);
+	if (IS_ERR(di)) {
+		int ret = PTR_ERR(di);
+
+		btrfs_release_path(&path);
+		return ret;
+	}
+
+	if (!di) {
+		/*
+		 * No explicit default means the top-level subvolume (id 5).
+		 */
+		btrfs_release_path(&path);
+		*subvolid = BTRFS_FS_TREE_OBJECTID;
+		return 0;
+	}
+
+	btrfs_dir_item_key_to_cpu(path.nodes[0], di, &location);
+	btrfs_release_path(&path);
+
+	*subvolid = location.objectid;
+	return 0;
+}
 
 static int read_inode_info(struct btrfs_root *root, u64 ino,
 			   struct inode_info *info)
@@ -1084,6 +1116,7 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 	struct btrfs_root *root;
 	struct open_ctree_args oca = { 0 };
 	struct btrfs_key key;
+	u64 default_subvolid = BTRFS_FS_TREE_OBJECTID;
 	const char *device;
 	const char *output;
 	char gz_mode[8];
@@ -1170,13 +1203,21 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
-	key.objectid = BTRFS_FS_TREE_OBJECTID;
+	ret = read_default_subvolid(fs_info, &default_subvolid);
+	if (ret < 0) {
+		error("failed to read default subvolume id: %d", ret);
+		close_ctree(fs_info->tree_root);
+		return 1;
+	}
+
+	key.objectid = default_subvolid;
 	key.type     = BTRFS_ROOT_ITEM_KEY;
 	key.offset   = (u64)-1;
 
-	root = btrfs_read_fs_root_no_cache(fs_info, &key);
+	root = btrfs_read_fs_root(fs_info, &key);
 	if (IS_ERR(root)) {
-		error("failed to read filesystem tree: %ld", PTR_ERR(root));
+		error("failed to read default subvolume %llu: %ld",
+		      (unsigned long long)default_subvolid, PTR_ERR(root));
 		close_ctree(fs_info->tree_root);
 		return 1;
 	}
