@@ -460,6 +460,101 @@ struct inode_info {
 	u64 mtime;	/* seconds since epoch */
 };
 
+static int resolve_subvolid_by_path(struct btrfs_fs_info *fs_info,
+				    const char *subvol_path, u64 *subvolid)
+{
+	struct btrfs_root *root = fs_info->fs_root;
+	struct btrfs_path path = { 0 };
+	char *path_copy = NULL, *cur, *next;
+	u64 dir_ino = BTRFS_FIRST_FREE_OBJECTID;
+	int ret = 0;
+
+	while (*subvol_path == '/')
+		subvol_path++;
+
+	if (*subvol_path == '\0' || strcmp(subvol_path, ".") == 0) {
+		*subvolid = BTRFS_FS_TREE_OBJECTID;
+		return 0;
+	}
+
+	path_copy = strdup(subvol_path);
+	if (!path_copy)
+		return -ENOMEM;
+
+	cur = path_copy;
+	while (*cur) {
+		struct btrfs_dir_item *di;
+		struct btrfs_key location;
+		u8 type;
+
+		while (*cur == '/')
+			cur++;
+		if (*cur == '\0')
+			break;
+
+		next = strchr(cur, '/');
+		if (next)
+			*next = '\0';
+
+		if (strcmp(cur, ".") == 0)
+			goto next_component;
+
+		di = btrfs_lookup_dir_item(NULL, root, &path, dir_ino,
+					   cur, strlen(cur), 0);
+		if (IS_ERR(di)) {
+			ret = PTR_ERR(di);
+			goto out;
+		}
+		if (!di) {
+			ret = -ENOENT;
+			goto out;
+		}
+
+		btrfs_dir_item_key_to_cpu(path.nodes[0], di, &location);
+		type = btrfs_dir_ftype(path.nodes[0], di);
+		btrfs_release_path(&path);
+
+		if (!next || next[1] == '\0') {
+			if (location.type != BTRFS_ROOT_ITEM_KEY) {
+				error("path '%s' does not refer to a subvolume",
+				      subvol_path);
+				ret = -EINVAL;
+				goto out;
+			}
+			*subvolid = location.objectid;
+			goto out;
+		}
+
+		if (location.type == BTRFS_ROOT_ITEM_KEY) {
+			location.offset = (u64)-1;
+			root = btrfs_read_fs_root(fs_info, &location);
+			if (IS_ERR(root)) {
+				ret = PTR_ERR(root);
+				goto out;
+			}
+			dir_ino = BTRFS_FIRST_FREE_OBJECTID;
+		} else if (type == BTRFS_FT_DIR) {
+			dir_ino = location.objectid;
+		} else {
+			error("path component '%s' in '%s' is not a directory",
+			      cur, subvol_path);
+			ret = -ENOTDIR;
+			goto out;
+		}
+
+next_component:
+		if (!next)
+			break;
+		cur = next + 1;
+	}
+
+	ret = -ENOENT;
+out:
+	btrfs_release_path(&path);
+	free(path_copy);
+	return ret;
+}
+
 static int read_default_subvolid(struct btrfs_fs_info *fs_info, u64 *subvolid)
 {
 	struct btrfs_path path = { 0 };
@@ -1085,11 +1180,15 @@ static const char * const usage_msg[] = {
 	"Convert an unmounted btrfs block device to a gzip-compressed tar archive",
 	"",
 	"The device must not be mounted.  All files, directories, and symlinks",
-	"in the default subvolume are written to <output.tar.gz> in POSIX ustar",
-	"format.  Sparse file regions are preserved as zero-filled data.",
+	"in the selected subvolume are written to <output.tar.gz> in POSIX ustar",
+	"format. By default the filesystem default subvolume is used, falling",
+	"back to the top-level subvolume (id 5) when none is set. Sparse file",
+	"regions are preserved as zero-filled data.",
 	"",
 	"Options:",
 	OPTLINE("-c|--compress <0-9>", "gzip compression level: 0=none 1=fastest(default) 9=best"),
+	OPTLINE("-r|--subvolid <id>",  "export the specified subvolume id instead of the default"),
+	OPTLINE("-S|--subvol <path>",  "export the subvolume at the given top-level path"),
 	OPTLINE("-s|--snapshots",      "also include snapshots (default: skipped)"),
 	OPTLINE("-v|--verbose",        "print each path as it is added to the archive"),
 	OPTLINE("-h|--help",           "show this help and exit"),
@@ -1117,6 +1216,8 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 	struct open_ctree_args oca = { 0 };
 	struct btrfs_key key;
 	u64 default_subvolid = BTRFS_FS_TREE_OBJECTID;
+	bool subvolid_set = false;
+	const char *subvol_path = NULL;
 	const char *device;
 	const char *output;
 	char gz_mode[8];
@@ -1131,12 +1232,14 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 	while (1) {
 		static const struct option long_opts[] = {
 			{ "compress",  required_argument, NULL, 'c' },
+			{ "subvolid",  required_argument, NULL, 'r' },
+			{ "subvol",    required_argument, NULL, 'S' },
 			{ "snapshots", no_argument,       NULL, 's' },
 			{ "verbose",   no_argument,       NULL, 'v' },
 			{ "help",      no_argument,       NULL, 'h' },
 			{ NULL, 0, NULL, 0 }
 		};
-		int c = getopt_long(argc, argv, "c:svh", long_opts, NULL);
+		int c = getopt_long(argc, argv, "c:r:S:svh", long_opts, NULL);
 
 		if (c < 0)
 			break;
@@ -1152,6 +1255,13 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 			ctx.compress_level = (int)level;
 			break;
 		}
+		case 'r':
+			default_subvolid = arg_strtou64(optarg);
+			subvolid_set = true;
+			break;
+		case 'S':
+			subvol_path = optarg;
+			break;
 		case 's':
 			ctx.get_snaps = true;
 			break;
@@ -1203,11 +1313,28 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
-	ret = read_default_subvolid(fs_info, &default_subvolid);
-	if (ret < 0) {
-		error("failed to read default subvolume id: %d", ret);
+	if (subvolid_set && subvol_path) {
+		error("--subvolid and --subvol are mutually exclusive");
 		close_ctree(fs_info->tree_root);
 		return 1;
+	}
+
+	if (subvol_path) {
+		ret = resolve_subvolid_by_path(fs_info, subvol_path,
+					       &default_subvolid);
+		if (ret < 0) {
+			error("failed to resolve subvolume path '%s': %d",
+			      subvol_path, ret);
+			close_ctree(fs_info->tree_root);
+			return 1;
+		}
+	} else if (!subvolid_set) {
+		ret = read_default_subvolid(fs_info, &default_subvolid);
+		if (ret < 0) {
+			error("failed to read default subvolume id: %d", ret);
+			close_ctree(fs_info->tree_root);
+			return 1;
+		}
 	}
 
 	key.objectid = default_subvolid;
