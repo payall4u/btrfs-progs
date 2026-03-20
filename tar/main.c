@@ -140,6 +140,11 @@ struct tar_ctx {
 	size_t io_buf_size;
 };
 
+struct path_map {
+	char *src;
+	char *dst;
+};
+
 /* ====================================================================
  * Btrfs data decompression helpers
  * (adapted from cmds/restore.c)
@@ -551,6 +556,115 @@ next_component:
 	ret = -ENOENT;
 out:
 	btrfs_release_path(&path);
+	free(path_copy);
+	return ret;
+}
+
+static int resolve_path_in_root(struct btrfs_root *start_root, const char *path,
+				struct btrfs_root **found_root, u64 *ino,
+				u8 *type)
+{
+	struct btrfs_root *root = start_root;
+	struct btrfs_path bpath = { 0 };
+	char *path_copy = NULL, *cur, *next;
+	u64 dir_ino = BTRFS_FIRST_FREE_OBJECTID;
+	int ret = 0;
+
+	while (*path == '/')
+		path++;
+
+	if (*path == '\0' || strcmp(path, ".") == 0) {
+		*found_root = root;
+		*ino = BTRFS_FIRST_FREE_OBJECTID;
+		*type = BTRFS_FT_DIR;
+		return 0;
+	}
+
+	path_copy = strdup(path);
+	if (!path_copy)
+		return -ENOMEM;
+
+	cur = path_copy;
+	while (*cur) {
+		struct btrfs_dir_item *di;
+		struct btrfs_key location;
+		u8 item_type;
+
+		while (*cur == '/')
+			cur++;
+		if (*cur == '\0')
+			break;
+
+		if (strcmp(cur, "..") == 0) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		next = strchr(cur, '/');
+		if (next)
+			*next = '\0';
+
+		if (strcmp(cur, ".") == 0)
+			goto next_component;
+
+		di = btrfs_lookup_dir_item(NULL, root, &bpath, dir_ino,
+					   cur, strlen(cur), 0);
+		if (IS_ERR(di)) {
+			ret = PTR_ERR(di);
+			goto out;
+		}
+		if (!di) {
+			ret = -ENOENT;
+			goto out;
+		}
+
+		btrfs_dir_item_key_to_cpu(bpath.nodes[0], di, &location);
+		item_type = btrfs_dir_ftype(bpath.nodes[0], di);
+		btrfs_release_path(&bpath);
+
+		if (!next || next[1] == '\0') {
+			if (location.type == BTRFS_ROOT_ITEM_KEY) {
+				location.offset = (u64)-1;
+				root = btrfs_read_fs_root(root->fs_info, &location);
+				if (IS_ERR(root)) {
+					ret = PTR_ERR(root);
+					goto out;
+				}
+				*found_root = root;
+				*ino = BTRFS_FIRST_FREE_OBJECTID;
+				*type = BTRFS_FT_DIR;
+			} else {
+				*found_root = root;
+				*ino = location.objectid;
+				*type = item_type;
+			}
+			goto out;
+		}
+
+		if (location.type == BTRFS_ROOT_ITEM_KEY) {
+			location.offset = (u64)-1;
+			root = btrfs_read_fs_root(root->fs_info, &location);
+			if (IS_ERR(root)) {
+				ret = PTR_ERR(root);
+				goto out;
+			}
+			dir_ino = BTRFS_FIRST_FREE_OBJECTID;
+		} else if (item_type == BTRFS_FT_DIR) {
+			dir_ino = location.objectid;
+		} else {
+			ret = -ENOTDIR;
+			goto out;
+		}
+
+next_component:
+		if (!next)
+			break;
+		cur = next + 1;
+	}
+
+	ret = -ENOENT;
+out:
+	btrfs_release_path(&bpath);
 	free(path_copy);
 	return ret;
 }
@@ -1024,6 +1138,10 @@ static int write_symlink_entry(struct tar_ctx *ctx, struct btrfs_root *root,
 				info.mtime, target);
 }
 
+static int write_resolved_path(struct tar_ctx *ctx, struct btrfs_root *root,
+			       u64 ino, u8 type, const char *archive_path,
+			       bool include_self);
+
 /* ====================================================================
  * Directory traversal
  * ==================================================================== */
@@ -1210,6 +1328,36 @@ out:
 	return ret;
 }
 
+static int write_resolved_path(struct tar_ctx *ctx, struct btrfs_root *root,
+			       u64 ino, u8 type, const char *archive_path,
+			       bool include_self)
+{
+	int ret = 0;
+
+	if (type == BTRFS_FT_REG_FILE) {
+		if (!include_self || archive_path[0] == '\0')
+			return -EINVAL;
+		return write_file_entry(ctx, root, archive_path, ino);
+	}
+
+	if (type == BTRFS_FT_SYMLINK) {
+		if (!include_self || archive_path[0] == '\0')
+			return -EINVAL;
+		return write_symlink_entry(ctx, root, archive_path, ino);
+	}
+
+	if (type != BTRFS_FT_DIR)
+		return 0;
+
+	if (include_self && archive_path[0] != '\0') {
+		ret = write_dir_entry(ctx, root, archive_path, ino);
+		if (ret < 0)
+			return ret;
+	}
+
+	return traverse_dir(ctx, root, ino, archive_path);
+}
+
 /* ====================================================================
  * Entry point
  * ==================================================================== */
@@ -1228,6 +1376,8 @@ static const char * const usage_msg[] = {
 	OPTLINE("-c|--compress <0-9>", "gzip compression level: 0=none 1=fastest(default) 9=best"),
 	OPTLINE("-r|--subvolid <id>",  "export the specified subvolume id instead of the default"),
 	OPTLINE("-S|--subvol <path>",  "export the subvolume at the given top-level path"),
+	OPTLINE("-R|--root-path <path>", "use the given path inside the selected subvolume as archive root"),
+	OPTLINE("-M|--path-map <src:dst>", "archive src from selected subvolume again at dst to override path contents"),
 	OPTLINE("-s|--snapshots",      "also include snapshots (default: skipped)"),
 	OPTLINE("-v|--verbose",        "print each path as it is added to the archive"),
 	OPTLINE("-h|--help",           "show this help and exit"),
@@ -1257,6 +1407,9 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 	u64 default_subvolid = BTRFS_FS_TREE_OBJECTID;
 	bool subvolid_set = false;
 	const char *subvol_path = NULL;
+	const char *root_path = NULL;
+	struct path_map *path_maps = NULL;
+	size_t nr_path_maps = 0, path_map_cap = 0, i;
 	const char *device;
 	const char *output;
 	char gz_mode[8];
@@ -1273,12 +1426,14 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 			{ "compress",  required_argument, NULL, 'c' },
 			{ "subvolid",  required_argument, NULL, 'r' },
 			{ "subvol",    required_argument, NULL, 'S' },
+			{ "root-path", required_argument, NULL, 'R' },
+			{ "path-map",  required_argument, NULL, 'M' },
 			{ "snapshots", no_argument,       NULL, 's' },
 			{ "verbose",   no_argument,       NULL, 'v' },
 			{ "help",      no_argument,       NULL, 'h' },
 			{ NULL, 0, NULL, 0 }
 		};
-		int c = getopt_long(argc, argv, "c:r:S:svh", long_opts, NULL);
+		int c = getopt_long(argc, argv, "c:r:S:R:M:svh", long_opts, NULL);
 
 		if (c < 0)
 			break;
@@ -1301,6 +1456,41 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		case 'S':
 			subvol_path = optarg;
 			break;
+		case 'R':
+			root_path = optarg;
+			break;
+		case 'M': {
+			char *arg = strdup(optarg);
+			char *sep;
+
+			if (!arg)
+				return 1;
+			sep = strchr(arg, ':');
+			if (!sep) {
+				free(arg);
+				error("path map must use src:dst syntax");
+				return 1;
+			}
+			*sep = '\0';
+			if (path_map_cap == nr_path_maps) {
+				size_t new_cap = path_map_cap ? path_map_cap * 2 : 4;
+				struct path_map *tmp;
+
+				tmp = realloc(path_maps, new_cap * sizeof(*path_maps));
+				if (!tmp) {
+					free(arg);
+					return 1;
+				}
+				path_maps = tmp;
+				path_map_cap = new_cap;
+			}
+			path_maps[nr_path_maps].src = arg;
+			path_maps[nr_path_maps].dst = strdup(sep + 1);
+			if (!path_maps[nr_path_maps].dst)
+				return 1;
+			nr_path_maps++;
+			break;
+		}
 		case 's':
 			ctx.get_snaps = true;
 			break;
@@ -1396,10 +1586,54 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
-	ret = traverse_dir(&ctx, root, BTRFS_FIRST_FREE_OBJECTID, "");
+	if (root_path) {
+		struct btrfs_root *start_root;
+		u64 start_ino;
+		u8 start_type;
+
+		ret = resolve_path_in_root(root, root_path, &start_root,
+					   &start_ino, &start_type);
+		if (ret < 0) {
+			error("failed to resolve root path '%s': %d",
+			      root_path, ret);
+			goto out;
+		}
+		if (start_type != BTRFS_FT_DIR) {
+			error("root path '%s' is not a directory", root_path);
+			ret = -ENOTDIR;
+			goto out;
+		}
+		ret = write_resolved_path(&ctx, start_root, start_ino,
+					  start_type, "", false);
+	} else {
+		ret = traverse_dir(&ctx, root, BTRFS_FIRST_FREE_OBJECTID, "");
+	}
 	if (ret) {
 		error("filesystem traversal failed: %d", ret);
 		goto out;
+	}
+
+	for (i = 0; i < nr_path_maps; i++) {
+		struct btrfs_root *map_root;
+		u64 map_ino;
+		u8 map_type;
+		const char *dst = path_maps[i].dst;
+		ret = resolve_path_in_root(root, path_maps[i].src, &map_root,
+					   &map_ino, &map_type);
+		if (ret < 0) {
+			error("failed to resolve path map source '%s': %d",
+			      path_maps[i].src, ret);
+			goto out;
+		}
+		while (*dst == '/')
+			dst++;
+		ret = write_resolved_path(&ctx, map_root, map_ino, map_type,
+					  dst, true);
+		if (ret < 0) {
+			error("failed to apply path map '%s:%s': %d",
+			      path_maps[i].src, path_maps[i].dst, ret);
+			goto out;
+		}
 	}
 
 	/* End-of-archive: two consecutive 512-byte zero blocks */
@@ -1408,6 +1642,11 @@ out:
 	gzclose(ctx.gz);
 	close_ctree(root);
 	free(ctx.io_buf);
+	for (i = 0; i < nr_path_maps; i++) {
+		free(path_maps[i].src);
+		free(path_maps[i].dst);
+	}
+	free(path_maps);
 
 	if (ret)
 		unlink(output);

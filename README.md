@@ -18,6 +18,7 @@ This repository hosts following utilities and also documentation:
 
 * **btrfs** &mdash; the main administration tool ([manual page](https://btrfs.readthedocs.io/en/latest/btrfs.html))
 * **mkfs.btrfs** &mdash; utility to create the filesystem ([manual page](https://btrfs.readthedocs.io/en/latest/mkfs.btrfs.html))
+* **btrfs-tar** &mdash; offline Btrfs-to-tar exporter, see [tar/README.md](tar/README.md) for usage and archive layout details
 * all-in-one binary in the busybox style with mkfs.btrfs, btrfs-image and other tools built-in ([standalone tools](https://btrfs.readthedocs.io/en/latest/btrfs.html#standalone-tools))
 * **libbtrfsutil** (LGPL v2.1) &mdash; C and python 3 bindings, see [libbtrfsutil/README.md](libbtrfsutil/README.md) for more
 * **btrfsutil** python bindings published at https://pypi.org/project/btrfsutil
