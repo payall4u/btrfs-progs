@@ -145,6 +145,47 @@ struct path_map {
 	char *dst;
 };
 
+static int append_path_map(struct path_map **maps, size_t *nr_maps,
+			       size_t *map_cap, const char *arg,
+			       const char *what)
+{
+	char *dup = strdup(arg);
+	char *sep;
+	struct path_map *tmp;
+
+	if (!dup)
+		return -ENOMEM;
+
+	sep = strchr(dup, ':');
+	if (!sep) {
+		free(dup);
+		error("%s must use src:dst syntax", what);
+		return -EINVAL;
+	}
+
+	*sep = '\0';
+	if ((*map_cap) == (*nr_maps)) {
+		size_t new_cap = *map_cap ? *map_cap * 2 : 4;
+
+		tmp = realloc(*maps, new_cap * sizeof(**maps));
+		if (!tmp) {
+			free(dup);
+			return -ENOMEM;
+		}
+		*maps = tmp;
+		*map_cap = new_cap;
+	}
+
+	(*maps)[*nr_maps].src = dup;
+	(*maps)[*nr_maps].dst = strdup(sep + 1);
+	if (!(*maps)[*nr_maps].dst) {
+		free(dup);
+		return -ENOMEM;
+	}
+	(*nr_maps)++;
+	return 0;
+}
+
 /* ====================================================================
  * Btrfs data decompression helpers
  * (adapted from cmds/restore.c)
@@ -1378,6 +1419,7 @@ static const char * const usage_msg[] = {
 	OPTLINE("-S|--subvol <path>",  "export the subvolume at the given top-level path"),
 	OPTLINE("-R|--root-path <path>", "use the given path inside the selected subvolume as archive root"),
 	OPTLINE("-M|--path-map <src:dst>", "archive src from selected subvolume again at dst to override path contents"),
+	OPTLINE("-E|--export-path <src:dst>", "archive only src from the selected subvolume at dst"),
 	OPTLINE("-s|--snapshots",      "also include snapshots (default: skipped)"),
 	OPTLINE("-v|--verbose",        "print each path as it is added to the archive"),
 	OPTLINE("-h|--help",           "show this help and exit"),
@@ -1409,7 +1451,9 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 	const char *subvol_path = NULL;
 	const char *root_path = NULL;
 	struct path_map *path_maps = NULL;
-	size_t nr_path_maps = 0, path_map_cap = 0, i;
+	struct path_map *export_paths = NULL;
+	size_t nr_path_maps = 0, path_map_cap = 0;
+	size_t nr_export_paths = 0, export_path_cap = 0, i;
 	const char *device;
 	const char *output;
 	char gz_mode[8];
@@ -1428,12 +1472,13 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 			{ "subvol",    required_argument, NULL, 'S' },
 			{ "root-path", required_argument, NULL, 'R' },
 			{ "path-map",  required_argument, NULL, 'M' },
+			{ "export-path", required_argument, NULL, 'E' },
 			{ "snapshots", no_argument,       NULL, 's' },
 			{ "verbose",   no_argument,       NULL, 'v' },
 			{ "help",      no_argument,       NULL, 'h' },
 			{ NULL, 0, NULL, 0 }
 		};
-		int c = getopt_long(argc, argv, "c:r:S:R:M:svh", long_opts, NULL);
+		int c = getopt_long(argc, argv, "c:r:S:R:M:E:svh", long_opts, NULL);
 
 		if (c < 0)
 			break;
@@ -1459,38 +1504,18 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		case 'R':
 			root_path = optarg;
 			break;
-		case 'M': {
-			char *arg = strdup(optarg);
-			char *sep;
-
-			if (!arg)
+		case 'M':
+			ret = append_path_map(&path_maps, &nr_path_maps,
+					      &path_map_cap, optarg, "path map");
+			if (ret < 0)
 				return 1;
-			sep = strchr(arg, ':');
-			if (!sep) {
-				free(arg);
-				error("path map must use src:dst syntax");
-				return 1;
-			}
-			*sep = '\0';
-			if (path_map_cap == nr_path_maps) {
-				size_t new_cap = path_map_cap ? path_map_cap * 2 : 4;
-				struct path_map *tmp;
-
-				tmp = realloc(path_maps, new_cap * sizeof(*path_maps));
-				if (!tmp) {
-					free(arg);
-					return 1;
-				}
-				path_maps = tmp;
-				path_map_cap = new_cap;
-			}
-			path_maps[nr_path_maps].src = arg;
-			path_maps[nr_path_maps].dst = strdup(sep + 1);
-			if (!path_maps[nr_path_maps].dst)
-				return 1;
-			nr_path_maps++;
 			break;
-		}
+		case 'E':
+			ret = append_path_map(&export_paths, &nr_export_paths,
+					      &export_path_cap, optarg, "export path");
+			if (ret < 0)
+				return 1;
+			break;
 		case 's':
 			ctx.get_snaps = true;
 			break;
@@ -1548,6 +1573,18 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
+	if (nr_export_paths && root_path) {
+		error("--export-path and --root-path are mutually exclusive");
+		close_ctree(fs_info->tree_root);
+		return 1;
+	}
+
+	if (nr_export_paths && nr_path_maps) {
+		error("--export-path and --path-map are mutually exclusive");
+		close_ctree(fs_info->tree_root);
+		return 1;
+	}
+
 	if (subvol_path) {
 		ret = resolve_subvolid_by_path(fs_info, subvol_path,
 					       &default_subvolid);
@@ -1586,53 +1623,81 @@ int BOX_MAIN(tar)(int argc, char *argv[])
 		return 1;
 	}
 
-	if (root_path) {
-		struct btrfs_root *start_root;
-		u64 start_ino;
-		u8 start_type;
+	if (nr_export_paths) {
+		for (i = 0; i < nr_export_paths; i++) {
+			struct btrfs_root *export_root;
+			u64 export_ino;
+			u8 export_type;
+			const char *dst = export_paths[i].dst;
 
-		ret = resolve_path_in_root(root, root_path, &start_root,
-					   &start_ino, &start_type);
-		if (ret < 0) {
-			error("failed to resolve root path '%s': %d",
-			      root_path, ret);
-			goto out;
+			ret = resolve_path_in_root(root, export_paths[i].src,
+						   &export_root, &export_ino,
+						   &export_type);
+			if (ret < 0) {
+				error("failed to resolve export path source '%s': %d",
+				      export_paths[i].src, ret);
+				goto out;
+			}
+			while (*dst == '/')
+				dst++;
+			ret = write_resolved_path(&ctx, export_root, export_ino,
+						  export_type, dst, true);
+			if (ret < 0) {
+				error("failed to export path '%s:%s': %d",
+				      export_paths[i].src, export_paths[i].dst, ret);
+				goto out;
+			}
 		}
-		if (start_type != BTRFS_FT_DIR) {
-			error("root path '%s' is not a directory", root_path);
-			ret = -ENOTDIR;
-			goto out;
-		}
-		ret = write_resolved_path(&ctx, start_root, start_ino,
-					  start_type, "", false);
 	} else {
-		ret = traverse_dir(&ctx, root, BTRFS_FIRST_FREE_OBJECTID, "");
-	}
-	if (ret) {
-		error("filesystem traversal failed: %d", ret);
-		goto out;
-	}
+		if (root_path) {
+			struct btrfs_root *start_root;
+			u64 start_ino;
+			u8 start_type;
 
-	for (i = 0; i < nr_path_maps; i++) {
-		struct btrfs_root *map_root;
-		u64 map_ino;
-		u8 map_type;
-		const char *dst = path_maps[i].dst;
-		ret = resolve_path_in_root(root, path_maps[i].src, &map_root,
-					   &map_ino, &map_type);
-		if (ret < 0) {
-			error("failed to resolve path map source '%s': %d",
-			      path_maps[i].src, ret);
+			ret = resolve_path_in_root(root, root_path, &start_root,
+						   &start_ino, &start_type);
+			if (ret < 0) {
+				error("failed to resolve root path '%s': %d",
+				      root_path, ret);
+				goto out;
+			}
+			if (start_type != BTRFS_FT_DIR) {
+				error("root path '%s' is not a directory", root_path);
+				ret = -ENOTDIR;
+				goto out;
+			}
+			ret = write_resolved_path(&ctx, start_root, start_ino,
+						  start_type, "", false);
+		} else {
+			ret = traverse_dir(&ctx, root, BTRFS_FIRST_FREE_OBJECTID, "");
+		}
+		if (ret) {
+			error("filesystem traversal failed: %d", ret);
 			goto out;
 		}
-		while (*dst == '/')
-			dst++;
-		ret = write_resolved_path(&ctx, map_root, map_ino, map_type,
-					  dst, true);
-		if (ret < 0) {
-			error("failed to apply path map '%s:%s': %d",
-			      path_maps[i].src, path_maps[i].dst, ret);
-			goto out;
+
+		for (i = 0; i < nr_path_maps; i++) {
+			struct btrfs_root *map_root;
+			u64 map_ino;
+			u8 map_type;
+			const char *dst = path_maps[i].dst;
+
+			ret = resolve_path_in_root(root, path_maps[i].src, &map_root,
+						   &map_ino, &map_type);
+			if (ret < 0) {
+				error("failed to resolve path map source '%s': %d",
+				      path_maps[i].src, ret);
+				goto out;
+			}
+			while (*dst == '/')
+				dst++;
+			ret = write_resolved_path(&ctx, map_root, map_ino, map_type,
+						  dst, true);
+			if (ret < 0) {
+				error("failed to apply path map '%s:%s': %d",
+				      path_maps[i].src, path_maps[i].dst, ret);
+				goto out;
+			}
 		}
 	}
 
@@ -1647,6 +1712,11 @@ out:
 		free(path_maps[i].dst);
 	}
 	free(path_maps);
+	for (i = 0; i < nr_export_paths; i++) {
+		free(export_paths[i].src);
+		free(export_paths[i].dst);
+	}
+	free(export_paths);
 
 	if (ret)
 		unlink(output);

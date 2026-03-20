@@ -76,6 +76,29 @@ stores `diff/etc/...` as `etc/...` in the archive, and `diff/var/...` as
 
 In other words, `--root-path` strips the chosen prefix from archive paths.
 
+## Exporting only selected paths
+
+`--export-path <src:dst>` archives only the selected path from the chosen
+subvolume and writes it at the requested archive destination.
+
+- `src` is resolved from the **selected subvolume root**
+- `dst` is the path written into the tar archive
+- if any `--export-path` is present, the normal subvolume traversal is skipped
+- multiple `--export-path` options are allowed
+- `--export-path` is mutually exclusive with `--root-path` and `--path-map`
+
+Example:
+
+```bash
+btrfs-tar \
+  --subvol workspace \
+  --export-path docker:var/lib/docker \
+  /dev/nbd100 workspace.tar.gz
+```
+
+This archives only `workspace/docker/*`, and stores it as
+`var/lib/docker/*` in the tar stream.
+
 ## Path remapping / overlaying
 
 `--path-map <src:dst>` replays an extra source subtree from the selected
@@ -140,6 +163,8 @@ Options:
   archive root
 - `-M, --path-map <src:dst>`: archive `src` from the selected subvolume again at
   `dst`
+- `-E, --export-path <src:dst>`: archive only `src` from the selected subvolume
+  at `dst`
 - `-s, --snapshots`: include nested snapshots/subvolumes during traversal
 - `-v, --verbose`: print each path as it is archived
 - `-h, --help`: show help
@@ -168,6 +193,12 @@ Export only a subtree as archive root:
 
 ```bash
 btrfs-tar --subvol workspace --root-path diff /dev/nbd100 rwlayer.tar.gz
+```
+
+Export only one selected path to a target archive location:
+
+```bash
+btrfs-tar --subvol workspace --export-path docker:var/lib/docker /dev/nbd100 docker.tar.gz
 ```
 
 Export a subtree and replay another directory into a different destination:
