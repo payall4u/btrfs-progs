@@ -678,12 +678,14 @@ out:
  * decompressed contents to the gzip stream.  Updates *written.
  */
 static int copy_inline_extent(struct btrfs_root *root, gzFile gz,
-			      struct btrfs_path *path, u64 *written)
+			      struct btrfs_path *path, u64 max_bytes,
+			      u64 *written)
 {
 	struct extent_buffer *leaf = path->nodes[0];
 	struct btrfs_file_extent_item *fi;
 	char *buf, *outbuf = NULL;
 	u64 ram_size;
+	u64 to_write;
 	unsigned long ptr;
 	int compress, inline_len;
 	int ret;
@@ -702,9 +704,10 @@ static int copy_inline_extent(struct btrfs_root *root, gzFile gz,
 	read_extent_buffer(leaf, buf, ptr, inline_len);
 
 	if (compress == BTRFS_COMPRESS_NONE) {
-		ret = gz_write(gz, buf, ram_size);
+		to_write = min_t(u64, ram_size, max_bytes);
+		ret = gz_write(gz, buf, to_write);
 		if (ret == 0)
-			*written = ram_size;
+			*written = to_write;
 		free(buf);
 		return ret;
 	}
@@ -717,9 +720,10 @@ static int copy_inline_extent(struct btrfs_root *root, gzFile gz,
 
 	ret = decompress(root, buf, outbuf, inline_len, &ram_size, compress);
 	if (ret == 0) {
-		ret = gz_write(gz, outbuf, ram_size);
+		to_write = min_t(u64, ram_size, max_bytes);
+		ret = gz_write(gz, outbuf, to_write);
 		if (ret == 0)
-			*written = ram_size;
+			*written = to_write;
 	}
 	free(buf);
 	free(outbuf);
@@ -736,12 +740,13 @@ static int copy_inline_extent(struct btrfs_root *root, gzFile gz,
 static int copy_reg_extent(struct tar_ctx *ctx, struct btrfs_root *root,
 			   struct extent_buffer *leaf,
 			   struct btrfs_file_extent_item *fi,
+			   u64 max_bytes,
 			   u64 *written)
 {
 	gzFile gz = ctx->gz;
 	char *inbuf, *outbuf = NULL;
 	u64 bytenr, ram_size, disk_size, num_bytes, offset;
-	u64 size_left, total = 0, cur, length;
+	u64 size_left, total = 0, cur, length, to_write;
 	int compress;
 	int mirror_num = 1, num_copies;
 	int ret = 0;
@@ -752,6 +757,7 @@ static int copy_reg_extent(struct tar_ctx *ctx, struct btrfs_root *root,
 	ram_size  = btrfs_file_extent_ram_bytes(leaf, fi);
 	offset    = btrfs_file_extent_offset(leaf, fi);
 	num_bytes = btrfs_file_extent_num_bytes(leaf, fi);
+	to_write  = min_t(u64, num_bytes, max_bytes);
 
 	/* Sparse hole – caller fills with zeros */
 	if (disk_size == 0) {
@@ -803,15 +809,15 @@ again:
 	}
 
 	if (compress == BTRFS_COMPRESS_NONE) {
-		while (total < num_bytes) {
-			size_t chunk = (size_t)min_t(u64, num_bytes - total,
+		while (total < to_write) {
+			size_t chunk = (size_t)min_t(u64, to_write - total,
 						     COPY_BUF_SIZE);
 			ret = gz_write(gz, inbuf + total, chunk);
 			if (ret < 0)
 				goto out;
 			total += chunk;
 		}
-		*written = num_bytes;
+		*written = to_write;
 		ret = 0;
 		goto out;
 	}
@@ -823,15 +829,15 @@ again:
 		goto out;
 	}
 
-	while (total < num_bytes) {
-		size_t chunk = (size_t)min_t(u64, num_bytes - total,
+	while (total < to_write) {
+		size_t chunk = (size_t)min_t(u64, to_write - total,
 					     COPY_BUF_SIZE);
 		ret = gz_write(gz, outbuf + offset + total, chunk);
 		if (ret < 0)
 			goto out;
 		total += chunk;
 	}
-	*written = num_bytes;
+	*written = to_write;
 out:
 	/* inbuf is ctx->io_buf – do not free it here */
 	free(outbuf);
@@ -903,9 +909,11 @@ static int write_file_data(struct tar_ctx *ctx, struct btrfs_root *root,
 
 		if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
 			ret = copy_inline_extent(root, gz, &path,
+						 file_size - current_offset,
 						 &bytes_written);
 		} else if (extent_type == BTRFS_FILE_EXTENT_REG) {
 			ret = copy_reg_extent(ctx, root, leaf, fi,
+					      file_size - current_offset,
 					      &bytes_written);
 		}
 		/* PREALLOC extents contain no initialized data – skip */
@@ -1102,15 +1110,20 @@ static int process_dir_entry(struct tar_ctx *ctx, struct btrfs_root *root,
 static int traverse_dir(struct tar_ctx *ctx, struct btrfs_root *root,
 			u64 dir_ino, const char *dir_path)
 {
+	struct dir_entry_info {
+		char *name;
+		u8 type;
+		struct btrfs_key location;
+	};
 	struct btrfs_path path = { 0 };
-	struct btrfs_key key, found_key, location;
+	struct btrfs_key key, found_key;
 	struct btrfs_dir_item *di;
-	struct extent_buffer *leaf;
+	struct dir_entry_info *entries = NULL;
+	size_t entry_count = 0, entry_cap = 0, i;
 	char filename[BTRFS_NAME_LEN + 1];
 	char entry_path[PATH_MAX];
 	unsigned long name_ptr;
 	int name_len;
-	u8 type;
 	int ret = 0;
 
 	key.objectid = dir_ino;
@@ -1120,12 +1133,13 @@ static int traverse_dir(struct tar_ctx *ctx, struct btrfs_root *root,
 	ret = btrfs_search_slot(NULL, root, &key, &path, 0, 0);
 	if (ret < 0)
 		goto out;
-	/* ret > 0 means the key wasn't found but path points at the next slot */
+	/* ret > 0 means the key wasn't found but points at next slot. */
 	ret = 0;
 
-	leaf = path.nodes[0];
-
 	while (1) {
+		struct extent_buffer *leaf;
+
+		leaf = path.nodes[0];
 		if (path.slots[0] >= btrfs_header_nritems(leaf)) {
 			ret = btrfs_next_leaf(root, &path);
 			if (ret > 0) {
@@ -1153,21 +1167,46 @@ static int traverse_dir(struct tar_ctx *ctx, struct btrfs_root *root,
 		read_extent_buffer(leaf, filename, name_ptr, name_len);
 		filename[name_len] = '\0';
 
-		type = btrfs_dir_ftype(leaf, di);
-		btrfs_dir_item_key_to_cpu(leaf, di, &location);
+		if (entry_count == entry_cap) {
+			size_t new_cap = entry_cap ? entry_cap * 2 : 16;
+			struct dir_entry_info *tmp;
 
-		snprintf(entry_path, sizeof(entry_path), "%s/%s",
-			 dir_path, filename);
-
-		ret = process_dir_entry(ctx, root, entry_path, type,
-					&location);
-		if (ret < 0)
+			tmp = realloc(entries, new_cap * sizeof(*entries));
+			if (!tmp) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			entries = tmp;
+			entry_cap = new_cap;
+		}
+		entries[entry_count].name = strdup(filename);
+		if (!entries[entry_count].name) {
+			ret = -ENOMEM;
 			goto out;
+		}
+		entries[entry_count].type = btrfs_dir_ftype(leaf, di);
+		btrfs_dir_item_key_to_cpu(leaf, di, &entries[entry_count].location);
+		entry_count++;
 
 		path.slots[0]++;
 	}
+
+	btrfs_release_path(&path);
+
+	for (i = 0; i < entry_count; i++) {
+		snprintf(entry_path, sizeof(entry_path), "%s/%s",
+			 dir_path, entries[i].name);
+
+		ret = process_dir_entry(ctx, root, entry_path, entries[i].type,
+					&entries[i].location);
+		if (ret < 0)
+			goto out;
+	}
 out:
 	btrfs_release_path(&path);
+	for (i = 0; i < entry_count; i++)
+		free(entries[i].name);
+	free(entries);
 	return ret;
 }
 

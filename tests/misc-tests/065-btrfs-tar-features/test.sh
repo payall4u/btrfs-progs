@@ -21,6 +21,7 @@ extract_dir_snaps="$tmp/extract-snaps"
 expected_sparse="$tmp/expected-sparse.bin"
 expected_plain="$tmp/expected-plain.txt"
 expected_long="$tmp/expected-long.txt"
+expected_tail="$tmp/expected-tail.bin"
 
 cleanup()
 {
@@ -80,6 +81,12 @@ run_check sh -c "printf 'BEGIN' | dd of='$expected_sparse' bs=1 seek=0 conv=notr
 run_check sh -c "printf 'MIDDLE' | dd of='$expected_sparse' bs=1 seek=524288 conv=notrunc status=none"
 run_check sh -c "printf 'END' | dd of='$expected_sparse' bs=1 seek=1048573 conv=notrunc status=none"
 
+run_check sh -c "python3 - <<'PY' > data/tail-extent.bin
+import sys
+sys.stdout.buffer.write((b'0123456789abcdef' * 631) + b'012')
+PY"
+run_check cp data/tail-extent.bin "$expected_tail"
+
 run_check $SUDO_HELPER "$TOP/btrfs" subvolume create subvol-src
 run_check sh -c "printf 'subvol-live\n' > subvol-src/live.txt"
 run_check $SUDO_HELPER "$TOP/btrfs" subvolume snapshot subvol-src snap-keep
@@ -109,6 +116,10 @@ fi
 
 if ! cmp -s "$extract_dir/data/sparse.bin" "$expected_sparse"; then
 	_fail "sparse file content mismatch after archive roundtrip"
+fi
+
+if ! cmp -s "$extract_dir/data/tail-extent.bin" "$expected_tail"; then
+	_fail "tail extent file content mismatch after archive roundtrip"
 fi
 
 size=$(stat -c %s "$extract_dir/data/sparse.bin")
